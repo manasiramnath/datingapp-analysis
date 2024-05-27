@@ -1,0 +1,301 @@
+---
+title: "Analysing Dating App Reviews"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+This project analyses reviews from dating apps to identify trends in user satisfaction and develop a predictive model for rating classification. Data from 240,000 reviews across four apps—Boo, Bumble, Hinge, and Tinder—are examined to understand sentiment differences and version-wise changes. Therefore, my research questions are as follows:
+
+1. How do the sentiment of reviews differ across dating apps and change over versions?
+2. How well can we classify the score a user has given the app based on the content of the review?
+
+```{r}
+# devtools package required to install quanteda from Github 
+remotes::install_github("quanteda/quanteda.textmodels")
+library(quanteda.textmodels)
+library(tidyverse)
+
+# Load data
+# Data taken from: https://www.kaggle.com/datasets/kavyasreeb/google-play-store-dating-app-reviews
+datingapp_reviews <- read.csv("dating_app.csv", stringsAsFactors=F)
+
+# Keep only the columns of interest
+datingapp_reviews <- datingapp_reviews[, c("app", "content", "reviewCreatedVersion", "score")]
+
+# Remove rows with empty reviewCreatedVersion
+datingapp_reviews <- datingapp_reviews[!datingapp_reviews$reviewCreatedVersion == "", ]
+datingapp_reviews$reviewCreatedVersion <- as.character(datingapp_reviews$reviewCreatedVersion)
+
+# Split by '.' and keep the first part of the version number and convert to integer
+### Copilot-generated
+datingapp_reviews$version <- as.integer(sapply(strsplit(datingapp_reviews$reviewCreatedVersion, "\\."), function(x) x[1]))
+
+# Removing non-ASCII characters (https://copyprogramming.com/howto/removing-non-english-text-from-corpus-in-r-using-tm)
+datingapp_reviews <- datingapp_reviews[which(!grepl("[^\x01-\x7F]+", datingapp_reviews$content)),]
+```
+
+I created a corpus from the review content and tokenised the text, removing numbers, and stopwords, and stemmed before creating a grouped DFM by app.
+
+```{r}
+library("quanteda", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("quanteda.textplots")
+# Create a corpus
+dcorpus <- corpus(datingapp_reviews$content)
+# Lowercase corpus
+dcorpus <- tolower(dcorpus)
+
+# Tokenising tweets and removing numbers, punctuation, and URLs
+dtoks <- tokens(dcorpus, remove_punct = TRUE, remove_symbols = TRUE, verbose=FALSE)
+
+# Remove @ 
+dtoks <- tokens_replace(dtoks, pattern = "@", replacement = "", valuetype = "regex")
+
+# Remove number patterns
+dtoks <- tokens_replace(dtoks, pattern = "[0-9]+", replacement = "", valuetype = "regex")
+
+# Remove # patterns
+dtoks <- tokens_replace(dtoks, pattern = "#", replacement = "", valuetype = "regex")
+
+# Removing stopwords
+# I removed the names of the dating apps from the stop words list since they would potentially dominate the results
+dtoks_stop <- tokens_remove(dtoks, c(stopwords("english"), "hinge*", "tinder*", "bumble*", "boo*", "app"))
+
+# Stemming words so that different forms of the same word are treated as the same word (like standout and standouts)
+dtoks_stem <- tokens_wordstem(dtoks_stop)
+
+# Creating a DFM
+reviews_dfm <- dfm(dtoks_stem)
+reviews_dfm <- dfm_trim(reviews_dfm, min_termfreq = 2, min_docfreq = 2, verbose = FALSE)
+
+# Grouping the DFM by app
+app_dfm <- dfm_group(reviews_dfm, group = datingapp_reviews$app)
+```
+
+A word cloud was generated to visualise the most frequent words in the reviews.
+
+```{r}
+library(quanteda)
+library(quanteda.textplots)
+
+# Plot word cloud
+textplot_wordcloud(app_dfm, comparison = TRUE, color = c("#0092ce", "#ff9a00", "#801a80", "#df0620"), labelcolor = "darkred", labelsize = 1, rotation = 0, min_size = 0.6, max_size = 4)
+```
+
+The largest words in the wordcloud are "good" and "nice" in Boo, suggesting user satisfaction is greater compared to other apps. Tinder's largest words appear to be about getting banned and other technical issues, insinuating that users are less satisfied with the app.
+
+The term frequency-inverse document frequency (TF-IDF) scores were computed for the grouped DFM to identify the top 20 words for each app, to get a better understanding of what users are talking about in their reviews.
+
+```{r}
+app_dfm_tfidf <- dfm_tfidf(app_dfm, scheme_tf = "prop")
+
+# Get the top 20 words for each app
+for (doc_name in rownames(app_dfm_tfidf)) {
+  # Get the TF-IDF scores for the current document (app)
+  doc_tfidf <- app_dfm_tfidf[doc_name, ]
+  
+  # Get the top 20 words for the current document
+  top_words <- topfeatures(doc_tfidf, 20)
+  
+  # Print the name of the document (app)
+  cat("Top 20 words for", doc_name, ":\n")
+  
+  # Print the top 20 words for the current document
+  print(top_words)
+  cat("\n")
+}
+```
+
+Across the apps, the top words are the unique features: For Boo it's "mbti", since users are matched by personality type; "beeline" for Bumble,  "rose" for Hinge, and "platinum" for Tinder. On Bumble, since women start conversations first, the top words being "feminist" and "empowering" are unsurprising. 
+
+To answer the first research question, I first use the NRC dictionary to identify the sentiment of the reviews. The NRC dictionary is a list of words and their associations with eight basic emotions and two sentiments. I selected three positive emotions and three negative over sentiments (positive or negative) to get a more nuanced understanding of the reviews.
+
+```{r}
+# Load libraries for dictionary
+library(quanteda.dictionaries)
+# remotes::install_github("quanteda/quanteda.sentiment")
+library(quanteda.sentiment)
+# Weight the dfm
+app_dfm_weighted <- dfm_weight(app_dfm, scheme = "prop")
+# Apply the dictionary
+app_dfm_dict <- dfm_lookup(app_dfm_weighted, dictionary = data_dictionary_NRC)
+
+# Specify 3 negative and 3 positive emotions of interest
+emotions_of_interest <- c("anger", "disgust", "sadness", "anticipation", "joy", "trust")
+
+# Subset the sentiment scores for the selected emotions
+app_dfm_dict <- app_dfm_dict[, emotions_of_interest]
+app_dfm_dict
+```
+The proportion of words associated with negative emotions (anger, disgust, and sadness) are highest in Tinder, with 2.5% of Tinder reviews containing words associated with anger, 1.4% with disgust, and 1.9% with sadness. Boo has a drastically higher proportion of words associated with all positive emotions, 10% of Boo reviews containing words associated with anticipation, joy, and trust respectively. Thus, it appears that across all reviews, Boo has the highest user satisfaction, and Tinder the lowest.
+
+I was then interested in user satisfaction over versions. Since the word cloud and top words suggest poorest user satisfaction in Tinder, I wanted to group Tinder reviews by version to see how sentiments have changed across version, so I can ascertain whether developers incorporate user feedback and improve the app.  
+
+```{r}
+# Subset dataset for 'Tinder' app
+tinder_reviews <- subset(datingapp_reviews, app == "Tinder")
+
+# Create a corpus
+tcorpus <- corpus(tinder_reviews$content)
+# Repeat pre-processing steps from before, but this time for Tinder subset only
+# Lowercase corpus
+tcorpus <- tolower(tcorpus)
+# Tokenising tweets and cleaning
+toks <- tokens(tcorpus, remove_punct = TRUE, remove_symbols = TRUE, verbose=FALSE)
+toks <- tokens_replace(toks, pattern = "@", replacement = "", valuetype = "regex")
+toks <- tokens_replace(toks, pattern = "[0-9]+", replacement = "", valuetype = "regex")
+toks <- tokens_replace(toks, pattern = "#", replacement = "", valuetype = "regex")
+toks_stop <- tokens_remove(toks, c(stopwords("english"), "tinder*", "app*"))
+toks_stem <- tokens_wordstem(toks_stop)
+
+# Creating a DFM
+tinder_dfm <- dfm(toks_stem)
+
+# Grouping the DFM by version
+version_dfm <- dfm_group(tinder_dfm, group = tinder_reviews$version)
+
+# Weight the dfm
+version_dfm_weighted <- dfm_weight(version_dfm, scheme = "prop")
+
+# Apply the dictionary
+version_dfm_dict <- dfm_lookup(version_dfm_weighted, dictionary = data_dictionary_NRC)
+
+# Subset the sentiment scores for the selected emotions
+version_dfm_dict <- version_dfm_dict[, emotions_of_interest]
+
+# Convert the dfm to a data frame
+tinder_df <- convert(version_dfm_dict, to = "data.frame")
+# Add the version as a column 
+tinder_df$version <- as.numeric(tinder_df$doc_id)
+# Pivot such that version is the column, and emotions are the rows
+tinder_df <- pivot_longer(tinder_df, cols = -c(doc_id, version), names_to = "emotion", values_to = "sentiment")
+# Subset the data to only include versions 3 and above because there are not enough reviews in the earlier versions
+tinder_df_filtered <- tinder_df[tinder_df$version >= 3, ]
+
+# Plotting the sentiment scores where y is the proportion of words associated with the emotion and x is the version of the app
+# line graph where colors are based on the emotion
+custom_breaks <- seq(min(tinder_df_filtered$version), max(tinder_df_filtered$version), by = 1)  # Customize interval between breaks
+
+ggplot(tinder_df_filtered, aes(x = version, y = sentiment, color = emotion)) +
+  geom_line() +
+  labs(title = "Sentiment of Tinder reviews by version", x = "Version", y = "Proportion of words associated with emotion") +
+  theme_minimal() +
+  scale_x_continuous(breaks = custom_breaks) +
+  scale_color_brewer(palette = "Dark2")
+```
+
+The sentiment of Tinder reviews differ across versions. The top 3 lines which are positive emotions, and there is a spike in the proportion of words associated with trust, anticipation, and joy in version 7, after which the proportions drastically drop and slowly increase in version 13. Interestingly, negative emotions (bottom 3 lines) are consistently lower across versions, with anger being the highest. The lack of a clear trend not only suggests that Tinder has mixed reviews across versions, but that developers may not have incorporated user feedback to consistently improve the app.
+
+My second question seeks to answer whether we can predict a user's rating of the app (high or low) based on their review. After creating a binary variable for rating, I trained a Naive Bayes classifier. 
+
+```{r}
+library("quanteda.textmodels")
+# Create a binary variable for the rating
+datingapp_reviews$rating <- ifelse(datingapp_reviews$score > 3, "high", "low")
+
+# Create a corpus
+dcorpus <- corpus(datingapp_reviews$content)
+
+# Create a document variable for the rating
+docvars(dcorpus, "rating") <- datingapp_reviews$rating
+
+# Lowercase corpus
+dcorpus <- tolower(dcorpus)
+
+# Tokenising tweets and removing numbers, punctuation, and URLs
+dtoks <- tokens(dcorpus, remove_punct = TRUE, remove_symbols = TRUE, verbose=FALSE)
+
+# N-grams (1-3) to capture multi-word phrases
+dtoks_ngram <- tokens_ngrams(dtoks, n = 1:3)
+
+# Remove stopwords
+dtoks_stop <- tokens_remove(dtoks_ngram, c(stopwords("english"), "hinge*", "tinder*", "bumble*", "boo*", "app*"))
+
+# Creating a DFM
+reviews_dfm <- dfm(dtoks_stop)
+# Removing words that appear only once
+reviews_dfm <- dfm_trim(reviews_dfm, min_termfreq = 2, verbose=FALSE)
+```
+
+```{r}
+# Splitting dataset into train and test
+set.seed(89)
+smp <- sample(c("train", "test"), size=ndoc(dcorpus), 
+                prob=c(0.80, 0.20), replace=TRUE)
+train <- which(smp=="train")
+test <- which(smp=="test")
+
+# Training Naive Bayes model
+nb <- textmodel_nb(reviews_dfm[train,], docvars(dcorpus, "rating")[train])
+# Predicting labels for test set
+preds <- predict(nb, newdata = reviews_dfm[test,])
+
+# Computing the confusion matrix
+(cm <- table(preds, docvars(dcorpus, "rating")[test]))
+# function to compute performance metrics
+precrecall <- function(mytable, verbose=TRUE) {
+    truePositives <- mytable[2,2]
+    falsePositives <- sum(mytable[2,]) - truePositives
+    falseNegatives <- sum(mytable[,2]) - truePositives
+    precision <- truePositives / (truePositives + falsePositives)
+    recall <- truePositives / (truePositives + falseNegatives)
+    if (verbose) {
+        cat("\n precision =", round(precision, 2), 
+            "\n    recall =", round(recall, 2), "\n")
+    }
+    invisible(c(precision, recall))
+}
+
+# precision and recall
+precrecall(cm)
+# accuracy
+accuracy = sum(diag(cm)) / sum(cm)
+cat("\n accuracy =", round(accuracy, 2), "\n")
+```
+The model performs very well -- accuracy shows the model correctly classified 87% of the instances. Overall precision and recall are 93% and 81% respectively, indicating it not only rarely makes mistakes in classifying high ratings, but also identifies most of the high rating instances. Classes are imbalanced, with more low ratings than high. Thus, the model has a tendency to predict low ratings better than high, which is good as it is more important to identify low ratings to improve the app. 
+
+```{r}
+# Which features are most important for the classification? 
+# Extracting posterior word probabilities
+get_posterior <- function(nb) {
+  PwGc <- nb$param
+  Pc <- nb$priors
+  PcGw <- PwGc * base::outer(Pc, rep(1, ncol(PwGc)))
+  PcGw <- matrix(sapply(PcGw, function(x) sqrt(sum(x^2))), nrow=2, dimnames = dimnames(PwGc))
+  names(dimnames(PcGw))[1] <- names(dimnames(PwGc))[1] <- "classes"
+  PwGc
+}
+probs <- get_posterior(nb)
+
+# Convert probs to a data frame
+probs_df <- data.frame(word = colnames(probs),
+                       high = probs["high",],
+                       low = probs["low",])
+
+# Sort the coefficients table by the 'high' column
+sorted_coefficients_high <- probs_df[order(-probs_df$high), ]
+# Sort the coefficients table by the 'low' column
+sorted_coefficients_low <- probs_df[order(-probs_df$low), ]
+
+# Extract the top 10 words for high and low ratings
+high_words <- head(sorted_coefficients_high$word, 10)
+low_words <- head(sorted_coefficients_low$word, 10)
+
+print("Top 10 words for high ratings:")
+print(high_words)
+
+print("Top 10 words for low ratings:")
+print(low_words)
+```
+The output above suggests that top 10 words for high ratings are much more relevant features to predict high ratings than the top 10 words for low ratings, and top 10 words for low ratings. However, while positive reviews express satisfaction to the app, negative reviews convey frustration, dissatisfaction, or issues with the app. Words like "just," "even," and "pay" suggest the user encountered problems or limitations related to the app's functionality or potential costs. Additionally, "money," "matches," and "people" might indicate the user is not satisfied with the value proposition or effectiveness in finding matches.
+
+# Appendix: All code
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+
+
